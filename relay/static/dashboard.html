@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Relay — live</title>
+<style>
+  :root { color-scheme: light dark; --fg: #1d1d1f; --bg: #fff; --muted: #6e6e73; --ok: #1f8a4c; --bad: #c0392b; --card: #f5f5f7; }
+  @media (prefers-color-scheme: dark) { :root { --fg: #f5f5f7; --bg: #000; --muted: #98989d; --card: #1c1c1e; } }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 15px/1.4 -apple-system, system-ui, sans-serif; background: var(--bg); color: var(--fg); padding: 24px; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: var(--muted); margin-bottom: 20px; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 20px; }
+  input { font: inherit; padding: 6px 8px; border-radius: 6px; border: 1px solid #8884; background: var(--bg); color: var(--fg); min-width: 260px; }
+  button { font: inherit; padding: 6px 12px; border-radius: 6px; border: 0; background: #0a84ff; color: #fff; cursor: pointer; }
+  button:disabled { opacity: .4; cursor: default; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; }
+  .card { background: var(--card); border-radius: 10px; padding: 14px; }
+  .label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+  .value { font-size: 28px; font-variant-numeric: tabular-nums; margin-top: 4px; }
+  .ok { color: var(--ok); } .bad { color: var(--bad); }
+  #status { color: var(--muted); margin-top: 16px; font-size: 13px; }
+</style>
+</head>
+<body>
+<h1>Relay</h1>
+<div class="sub">Live queue, throughput and correctness counters. Refreshes every 2 seconds.</div>
+
+<div class="row">
+  <input id="token" type="password" placeholder="Admin token">
+  <button id="connect">Connect</button>
+</div>
+<div class="row">
+  <input id="tenant" placeholder="Tenant ID for chaos jobs">
+  <button id="fire" disabled>Fire 10,000 jobs</button>
+</div>
+
+<div class="grid">
+  <div class="card"><div class="label">Queued</div><div class="value" id="queued">—</div></div>
+  <div class="card"><div class="label">Running</div><div class="value" id="running">—</div></div>
+  <div class="card"><div class="label">Succeeded</div><div class="value" id="succeeded">—</div></div>
+  <div class="card"><div class="label">Failed</div><div class="value" id="failed">—</div></div>
+  <div class="card"><div class="label">Throughput / min</div><div class="value" id="throughput">—</div></div>
+  <div class="card"><div class="label">Expired leases</div><div class="value" id="expired">—</div></div>
+  <div class="card"><div class="label">Lost</div><div class="value ok" id="lost">—</div></div>
+  <div class="card"><div class="label">Re-executions</div><div class="value" id="reexec">—</div></div>
+  <div class="card"><div class="label">Webhooks pending</div><div class="value" id="whpending">—</div></div>
+  <div class="card"><div class="label">Dead letters</div><div class="value" id="dead">—</div></div>
+</div>
+<div id="status"></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let token = sessionStorage.getItem("relayAdminToken") || "";
+let timer = null;
+
+async function refresh() {
+  if (!token) return;
+  const r = await fetch("/admin/stats", { headers: { "X-Admin-Token": token } });
+  if (!r.ok) { $("status").textContent = `stats: HTTP ${r.status}`; return; }
+  const s = await r.json();
+  const j = s.jobs;
+  // Lost = submitted jobs that are neither queued, running, nor finished.
+  const lost = j.total - (j.queued + j.running + j.succeeded + j.failed);
+  $("queued").textContent = j.queued;
+  $("running").textContent = j.running;
+  $("succeeded").textContent = j.succeeded;
+  $("failed").textContent = j.failed;
+  $("throughput").textContent = s.throughput_per_minute;
+  $("expired").textContent = s.expired_leases;
+  $("lost").textContent = lost;
+  $("lost").className = "value " + (lost === 0 ? "ok" : "bad");
+  $("reexec").textContent = s.re_executions;
+  $("whpending").textContent = s.webhooks.pending;
+  $("dead").textContent = s.webhooks.dead;
+  $("status").textContent = `updated ${new Date().toLocaleTimeString()}`;
+}
+
+$("connect").onclick = () => {
+  token = $("token").value.trim();
+  sessionStorage.setItem("relayAdminToken", token);
+  $("fire").disabled = !token || !$("tenant").value;
+  clearInterval(timer);
+  refresh();
+  timer = setInterval(refresh, 2000);
+};
+
+$("tenant").oninput = () => { $("fire").disabled = !token || !$("tenant").value; };
+
+$("fire").onclick = async () => {
+  $("fire").disabled = true;
+  const r = await fetch("/admin/chaos/fire", {
+    method: "POST",
+    headers: { "X-Admin-Token": token, "Content-Type": "application/json" },
+    body: JSON.stringify({ tenant_id: $("tenant").value.trim(), count: 10000 }),
+  });
+  $("status").textContent = r.ok ? "fired 10,000 jobs" : `fire failed: HTTP ${r.status}`;
+  $("fire").disabled = false;
+};
+
+if (token) { $("token").value = token; $("connect").click(); }
+</script>
+</body>
+</html>

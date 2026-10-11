@@ -1,0 +1,102 @@
+name: relay
+
+x-app: &app
+  build: .
+  environment:
+    DATABASE_URL: postgresql://relay:relay@postgres:5432/relay
+    REDIS_URL: redis://redis:6379/0
+    S3_BUCKET: relay-dev
+    S3_ENDPOINT_URL: http://minio:9000
+    AWS_ACCESS_KEY_ID: minioadmin
+    AWS_SECRET_ACCESS_KEY: minioadmin
+    AWS_REGION: us-east-1
+    LEASE_SECONDS: "30"
+    MAX_ATTEMPTS: "5"
+    RELAY_CHAOS_ENABLED: "1"
+    ADMIN_TOKEN: dev-admin-token
+    ALLOW_PRIVATE_WEBHOOKS: "1"
+  depends_on:
+    migrate:
+      condition: service_completed_successfully
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: relay
+      POSTGRES_PASSWORD: relay
+      POSTGRES_DB: relay
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U relay -d relay"]
+      interval: 2s
+      retries: 15
+
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      retries: 15
+
+  # Local S3. Production uses real S3 and leaves S3_ENDPOINT_URL unset.
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - miniodata:/data
+
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      until mc alias set local http://minio:9000 minioadmin minioadmin; do sleep 1; done;
+      mc mb --ignore-existing local/relay-dev;
+      exit 0;"
+
+  migrate:
+    <<: *app
+    build: .
+    command: ["python", "-m", "relay.cli", "migrate"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    <<: *app
+    command: ["uvicorn", "relay.api:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "8000:8000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+  worker:
+    <<: *app
+    command: ["python", "-m", "relay.worker"]
+    deploy:
+      replicas: 2
+
+  dispatcher:
+    <<: *app
+    command: ["python", "-m", "relay.dispatcher"]
+
+volumes:
+  pgdata:
+  miniodata:

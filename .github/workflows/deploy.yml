@@ -1,0 +1,79 @@
+name: Deploy
+
+# Runs only after CI passes on main. Authenticates to AWS with OIDC, so no keys live in GitHub.
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      AWS_REGION: us-east-1
+      ECR_REPOSITORY: relay
+      CLUSTER: relay-prod
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push the image
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          IMAGE="$REGISTRY/$ECR_REPOSITORY:$SHA"
+          docker build -t "$IMAGE" .
+          docker push "$IMAGE"
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+
+      # Register a new revision of each task definition with the new image, then roll the service.
+      # The ECS deployment circuit breaker rolls back automatically if new tasks fail to stabilize.
+      - name: Roll out api, worker and dispatcher
+        run: |
+          for svc in api worker dispatcher; do
+            td=$(aws ecs describe-task-definition --task-definition "relay-$svc" \
+                  --query taskDefinition --output json)
+            new=$(echo "$td" | jq --arg img "$IMAGE" '
+              .containerDefinitions[0].image = $img
+              | del(.taskDefinitionArn, .revision, .status, .requiresAttributes,
+                    .compatibilities, .registeredAt, .registeredBy)')
+            arn=$(aws ecs register-task-definition --cli-input-json "$new" \
+                  --query taskDefinition.taskDefinitionArn --output text)
+            aws ecs update-service --cluster "$CLUSTER" --service "relay-$svc" \
+              --task-definition "$arn" > /dev/null
+            echo "rolled relay-$svc to $arn"
+          done
+
+      - name: Wait for services to stabilize
+        run: |
+          for svc in api worker dispatcher; do
+            aws ecs wait services-stable --cluster "$CLUSTER" --services "relay-$svc"
+          done
+
+      - name: Smoke test the public endpoint
+        env:
+          API_URL: ${{ vars.API_URL }}
+        run: |
+          curl --fail --silent --show-error --retry 5 --retry-delay 5 "$API_URL/healthz"
